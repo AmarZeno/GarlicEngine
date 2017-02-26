@@ -1,0 +1,5 @@
+*.intermediates
+*.output
+*.db
+*.user
+*.opendb

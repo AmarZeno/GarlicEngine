@@ -1,0 +1,382 @@
+#include "HeapAllocator.h"
+#include <stdlib.h>
+#include "Diagnostics.h"
+#include <stdint.h>
+#include "Constants.h"
+
+#ifdef __GUARDBAND
+const uint8_t		HeapManager::guardbandValues[] = { 0xde, 0xad, 0xbe, 0xef }; // 0xdeadbeef
+const size_t		HeapManager::guardbandBytes = sizeof(guardbandValues);
+#endif // __GUARDBAND
+
+using namespace HeapAllocatorProxy;
+
+#define MEMSYSTEM_SIGNATURE 0xDEADC0DE
+#define MEMSYSTEM_ENDMARKER 0xE00DC0DE
+
+enum GarbageCollectionType
+{
+	DescriptorFix,
+	StorageFix
+};
+
+HeapAllocator::HeapAllocator()
+{
+}
+
+HeapAllocator::~HeapAllocator()
+{
+}
+
+namespace HeapAllocatorProxy {
+
+	HeapAllocator * Initialize(void * pHeapMemory, const size_t sizeHeap, const guint_t noOfDescriptors)
+	{
+		HeapAllocator *allocator = (HeapAllocator *)(pHeapMemory);
+
+		// Push the pHeapMemory forward
+		pHeapMemory = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(pHeapMemory) + sizeof(HeapAllocator) + sizeof(int));
+		// Making a local reference for all the passed values
+
+		allocator->pHeapMemSystem = pHeapMemory;
+		allocator->memSystemSize = sizeHeap;
+		allocator->numberOfDescriptors = noOfDescriptors;
+
+		allocator->pFreeMemoryList = pHeapMemory;
+
+		// Char sizes to 1. Instantiating the struct pointer within the available space
+
+		size_t  requiredDescriptorStorage = noOfDescriptors * sizeof(BlockDescriptor);
+
+		allocator->pFreeDescriptorList = reinterpret_cast<BlockDescriptor *>(reinterpret_cast<uintptr_t>(allocator->pFreeMemoryList) + sizeHeap) - requiredDescriptorStorage;
+		allocator->pFreeDescriptorList->pNext = allocator->pFreeDescriptorList + sizeof(BlockDescriptor);
+		allocator->pFreeDescriptorList->pPrev = nullptr;
+		allocator->pFreeDescriptorList->iSize = BASE_ZERO;
+		size_t currentBlockDescriptor = INITIAL_BLOCK_DESCRIPTOR;
+		while (true)
+		{
+			if (currentBlockDescriptor == allocator->numberOfDescriptors) {
+				break;
+			}
+			allocator->pFreeDescriptorList = allocator->pFreeDescriptorList->pNext;
+			if (currentBlockDescriptor == allocator->numberOfDescriptors - INITIAL_DESCRIPTOR_COUNT_OFFSET) {
+				allocator->pFreeDescriptorList->pNext = nullptr;
+			}
+			else {
+				allocator->pFreeDescriptorList->pNext = allocator->pFreeDescriptorList + sizeof(BlockDescriptor);
+			}
+
+			allocator->pFreeDescriptorList->pPrev = allocator->pFreeDescriptorList - sizeof(BlockDescriptor);
+			allocator->pFreeDescriptorList->iSize = BASE_ZERO;
+			currentBlockDescriptor++;
+		}
+
+		allocator->pFreeDescriptorList->pHeap = allocator->pFreeMemoryList;
+
+		allocator->pFreeDescriptorList->iSize = sizeHeap - (noOfDescriptors * sizeof(BlockDescriptor));
+
+
+		allocator->pOutstandingAllocatedList = nullptr;
+		return allocator;
+	}
+
+	// Setters and getters for static heap allocator
+	void AssignStaticHeapAllocator(HeapAllocator * heapAllocator)
+	{
+		staticHeapAllocator = heapAllocator;
+	}
+
+	HeapAllocator * GetHeapAllocator() 
+	{
+		return staticHeapAllocator;
+	}
+
+	void * Allocate(const size_t size, HeapAllocator * heapAllocator)
+	{
+		// Moving the free memory pointer after the requested size
+		size_t iRequestedBytes = size;
+
+#ifdef __GUARDBAND
+		// account for end guardband
+		iRequestedBytes += 2*guardbandBytes;
+#endif
+
+		size_t availableSize = GetAvailableSize(heapAllocator);
+
+		// Safety check and garbage collection if required
+		if (size == BASE_ZERO) {
+			return NULL;
+		}
+
+		if (iRequestedBytes > availableSize) {
+			return NULL;
+		}
+
+		// Check for available size descriptor
+		while (true)
+		{
+			if (iRequestedBytes < heapAllocator->pFreeDescriptorList->iSize) {
+				// Available size found in the matching block
+				// Do nothing
+				break;
+			}
+			else {
+				// Move to the previous available block
+				heapAllocator->pFreeDescriptorList = heapAllocator->pFreeDescriptorList->pPrev;
+			}
+
+			if (heapAllocator->pFreeDescriptorList->pPrev == nullptr) {
+				// garbage collection
+				GarbageCollect(heapAllocator);
+				break;
+			}
+		}
+
+		/*Current Allocation Block*/
+		// Steps for new allocation
+		// 1) Update allocation for the first entry
+		// 2) Update allocation for the following entry
+
+		if (heapAllocator->pOutstandingAllocatedList == nullptr) {
+			heapAllocator->pOutstandingAllocatedList = heapAllocator->pFreeDescriptorList;
+
+			heapAllocator->pOutstandingAllocatedList->pHeap = heapAllocator->pFreeDescriptorList->pHeap;
+			// Move the free block descriptor for the next allocation
+			heapAllocator->pFreeDescriptorList = heapAllocator->pFreeDescriptorList->pPrev;
+
+			heapAllocator->pOutstandingAllocatedList->pNext = nullptr;
+			heapAllocator->pOutstandingAllocatedList->pPrev = nullptr;
+
+			heapAllocator->pFreeDescriptorList->pNext = nullptr;
+		}
+		else {
+
+			BlockDescriptor *prevAllocatedList = heapAllocator->pOutstandingAllocatedList;
+			heapAllocator->pOutstandingAllocatedList = heapAllocator->pFreeDescriptorList;
+
+			// Check if pheap reached last, then do garbage collect
+
+
+			heapAllocator->pOutstandingAllocatedList->pHeap = heapAllocator->pFreeDescriptorList->pHeap;
+			// Move the free block descriptor for the next allocation
+			heapAllocator->pFreeDescriptorList = heapAllocator->pFreeDescriptorList->pPrev;
+			heapAllocator->pFreeDescriptorList->pNext = nullptr;
+
+			heapAllocator->pOutstandingAllocatedList->pNext = prevAllocatedList;
+			heapAllocator->pOutstandingAllocatedList->pPrev = nullptr;
+
+			heapAllocator->pOutstandingAllocatedList->pNext->pPrev = heapAllocator->pOutstandingAllocatedList;
+		}
+
+		heapAllocator->pOutstandingAllocatedList->iSize = iRequestedBytes;
+
+		if (heapAllocator->pFreeDescriptorList->pPrev == nullptr) {
+
+		}
+		else {
+			/*Next allocation Block*/
+			// Fetching previous block to update the next heap pointer
+			heapAllocator->pFreeDescriptorList->pHeap =reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(heapAllocator->pOutstandingAllocatedList->pHeap) + heapAllocator->pOutstandingAllocatedList->iSize);
+			// Subtracting available memory with used Memory
+			heapAllocator->pFreeDescriptorList->iSize = heapAllocator->memSystemSize - (heapAllocator->numberOfDescriptors * sizeof(BlockDescriptor)) - GetUsedSize(heapAllocator);
+			//pFreeDescriptorList->pPrev = pFreeDescriptorList + sizeof(BlockDescriptor);
+		}
+
+		//ResetFreeDescriptorList();
+
+#ifdef __GUARDBAND
+		// account for start guardband
+
+		uint8_t * pStartGuardband = heapAllocator->pOutstandingAllocatedList->pHeap;
+		heapAllocator->pOutstandingAllocatedList->pHeap -= guardbandBytes;
+#endif
+
+		return heapAllocator->pOutstandingAllocatedList->pHeap;
+	}
+
+
+	void * Deallocate(void * deallocatePointer, HeapAllocator * heapAllocator)
+	{
+		BlockDescriptor *tempOutstandingAllocatedList = heapAllocator->pOutstandingAllocatedList;
+		while (true)
+		{
+			if (deallocatePointer == tempOutstandingAllocatedList->pHeap) {
+
+				BlockDescriptor *deallocatedPointerRef = tempOutstandingAllocatedList;
+				//BlockDescriptor *swapPreviousFreeList = pFreeDescriptorList->pPrev;
+				//pFreeDescriptorList->pPrev = tempOutstandingAllocatedList;
+				//pFreeDescriptorList->pPrev->pPrev = swapPreviousFreeList;
+
+				/*Cases to connect Allocated list*/
+				// Case 1) When previous and next are null. Single block entry.
+				if (tempOutstandingAllocatedList->pPrev == nullptr && tempOutstandingAllocatedList->pNext == nullptr) {
+					heapAllocator->pOutstandingAllocatedList = nullptr;
+				}
+
+				// Case 2) When previous alone is nullptr. Multiple block entry. head at first position 
+				if (tempOutstandingAllocatedList->pPrev == nullptr && tempOutstandingAllocatedList->pNext != nullptr) {
+					//	pOutstandingAllocatedList->pNext->pPrev = nullptr;
+					heapAllocator->pOutstandingAllocatedList = heapAllocator->pOutstandingAllocatedList->pNext;
+					heapAllocator->pOutstandingAllocatedList->pPrev = nullptr;
+				}
+
+				// Case 3) When next alone is nullptr. Multiple block entry. removal at last position
+				if (tempOutstandingAllocatedList->pPrev != nullptr && tempOutstandingAllocatedList->pNext == nullptr) {
+					tempOutstandingAllocatedList->pPrev->pNext = nullptr;
+				}
+
+				// Case 4) When previous and next are not null. Multiple block entry. Removal from centre of a contigous block.
+				if (tempOutstandingAllocatedList->pPrev != nullptr && tempOutstandingAllocatedList->pNext != nullptr) {
+					tempOutstandingAllocatedList->pPrev->pNext = tempOutstandingAllocatedList->pNext;
+					tempOutstandingAllocatedList->pNext->pPrev = tempOutstandingAllocatedList->pPrev;
+				}
+
+				// Add the removed allocated element to the free list
+				/*tempOutstandingAllocatedList->pNext = pFreeDescriptorList;
+				tempOutstandingAllocatedList->pPrev = pFreeDescriptorList->pPrev;
+				pFreeDescriptorList->pPrev->pNext = tempOutstandingAllocatedList;
+				pFreeDescriptorList->pPrev = tempOutstandingAllocatedList;*/
+				AddToFreeBlocks(deallocatedPointerRef, heapAllocator);
+
+				deallocatePointer = nullptr;
+				break;
+			}
+			tempOutstandingAllocatedList = tempOutstandingAllocatedList->pNext;
+			if (tempOutstandingAllocatedList == nullptr) {
+				break;
+			}
+		}
+
+		return nullptr;
+	}
+
+	void AddToFreeBlocks(BlockDescriptor *freedBlock, HeapAllocator * heapAllocator)
+	{
+		// Start from beginning of free list
+		BlockDescriptor * pfreeDescriptorCurrentRef = heapAllocator->pFreeDescriptorList;
+		while (true)
+		{
+			if (freedBlock < pfreeDescriptorCurrentRef && pfreeDescriptorCurrentRef->pPrev == nullptr) {
+				// add the block before the head
+				freedBlock->pPrev = nullptr;
+				freedBlock->pNext = pfreeDescriptorCurrentRef;
+				pfreeDescriptorCurrentRef->pPrev = freedBlock;
+				break;
+			}
+			else  if (freedBlock > pfreeDescriptorCurrentRef && pfreeDescriptorCurrentRef->pNext == nullptr) {
+				// add the block at the tail
+				freedBlock->pNext = nullptr;
+				freedBlock->pPrev = pfreeDescriptorCurrentRef;
+				pfreeDescriptorCurrentRef->pNext = freedBlock;
+
+				// Reassign free descriptor to the last block
+				heapAllocator->pFreeDescriptorList = freedBlock;
+				break;
+			}
+			else if (freedBlock > pfreeDescriptorCurrentRef && freedBlock < pfreeDescriptorCurrentRef->pNext) {
+				// if address is greater than the current element and lesser than the next element
+				freedBlock->pNext = pfreeDescriptorCurrentRef->pNext;
+				freedBlock->pPrev = pfreeDescriptorCurrentRef;
+				pfreeDescriptorCurrentRef->pNext = freedBlock;
+				freedBlock->pNext->pPrev = freedBlock;
+				break;
+			}
+			if (pfreeDescriptorCurrentRef->pPrev == nullptr) {
+				// Break if it reaches the end of the linked list
+				break;
+			}
+			pfreeDescriptorCurrentRef = pfreeDescriptorCurrentRef->pPrev;
+		}
+	}
+
+
+	void GarbageCollect(HeapAllocator * heapAllocator)
+	{
+		ResetFreeDescriptorList(heapAllocator);
+
+		while (true)
+		{
+			if (reinterpret_cast<uintptr_t>(heapAllocator->pFreeDescriptorList->pHeap) + heapAllocator->pFreeDescriptorList->iSize == reinterpret_cast<uintptr_t>(heapAllocator->pFreeDescriptorList->pPrev->pHeap)) {
+				if (heapAllocator->pFreeDescriptorList->pHeap < heapAllocator->pFreeDescriptorList->pPrev->pHeap) {
+					heapAllocator->pFreeDescriptorList->iSize += heapAllocator->pFreeDescriptorList->pPrev->iSize;
+				}
+				else {
+					heapAllocator->pFreeDescriptorList->pHeap = heapAllocator->pFreeDescriptorList->pPrev->pHeap;
+					heapAllocator->pFreeDescriptorList->iSize += heapAllocator->pFreeDescriptorList->pPrev->iSize;
+				}
+			}
+			else
+			{
+				if (heapAllocator->pFreeDescriptorList->pPrev) {
+					break;
+				}
+				heapAllocator->pFreeDescriptorList = heapAllocator->pFreeDescriptorList->pPrev;
+			}
+		}
+
+		ResetFreeDescriptorList(heapAllocator);
+	}
+
+}
+
+// Overloading new and delete
+
+void * operator new(size_t i_size)
+{
+	HeapAllocator *heapAllocator = GetHeapAllocator();
+	return Allocate(i_size, heapAllocator);
+}
+
+void * operator new[](size_t i_size) {
+	HeapAllocator *heapAllocator = GetHeapAllocator();
+	return Allocate(i_size, heapAllocator);
+}
+
+void * operator new(size_t i_size, NewAlignment i_align) {
+	switch (i_align)
+	{
+	case NEW_ALIGN_16:
+	case NEW_ALIGN_32:
+		return _aligned_malloc(i_size, i_align);
+		break;
+	default:
+		return _aligned_malloc(i_size, DEFAULT_MEM_ALIGNMENT);
+		break;
+	}
+}
+
+void * operator new(size_t i_size, const char * i_pFile, unsigned int i_Line) {
+	// Print the tracked information
+	DEBUG_FUNCTION_NAME
+	EmitLocation(i_Line, i_pFile);
+
+	HeapAllocator *heapAllocator = GetHeapAllocator();
+	return Allocate(i_size, heapAllocator);
+}
+
+void operator delete(void * i_ptr)
+{
+	HeapAllocator * heapAllocator = GetHeapAllocator();
+	if (i_ptr) {
+		Deallocate(i_ptr, heapAllocator);
+	}
+	return;
+}
+
+void operator delete[](void * i_ptr)
+{
+	HeapAllocator * heapAllocator = GetHeapAllocator();
+	if (i_ptr) {
+		Deallocate(i_ptr, heapAllocator);
+	}
+	return;
+}
+
+void operator delete(void * i_ptr, const char * i_pFile, unsigned int i_Line) {
+	HeapAllocator * heapAllocator = GetHeapAllocator();
+	if (i_ptr) {
+		Deallocate(i_ptr, heapAllocator);
+	}
+	return;
+}
+

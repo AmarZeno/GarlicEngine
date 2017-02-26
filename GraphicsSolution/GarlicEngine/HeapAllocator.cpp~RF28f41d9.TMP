@@ -1,0 +1,266 @@
+#include "HeapAllocator.h"
+#include <stdlib.h>
+#include "Diagnostics.h"
+
+#define MEMSYSTEM_SIGNATURE 0xDEADC0DE
+#define MEMSYSTEM_ENDMARKER 0xE00DC0DE
+
+#define MEMSYSTEM_ALIGNMENT 4
+
+enum GarbageCollectionType
+{
+	DescriptorFix,
+	StorageFix
+};
+
+HeapAllocator::HeapAllocator()
+{
+	
+}
+
+
+HeapAllocator::~HeapAllocator()
+{
+}
+
+void * HeapAllocator::Initialize(void * pHeapMemory, const size_t sizeHeap, const unsigned int noOfDescriptors) {
+
+	// Making a local reference for all the passed values
+	pHeapMemSystem = pHeapMemory;
+	memSystemSize = sizeHeap;
+	numberOfDescriptors = noOfDescriptors;
+
+	pFreeMemoryList = pHeapMemory;
+	// Char sizes to 1. Instantiating the struct pointer within the available space
+
+	size_t  requiredDescriptorStorage = noOfDescriptors * sizeof(BlockDescriptor);
+
+	pFreeDescriptorList = (BlockDescriptor *)((char*)pFreeMemoryList + sizeHeap) - requiredDescriptorStorage;
+	pFreeDescriptorList->pNext = pFreeDescriptorList + sizeof(BlockDescriptor);
+	pFreeDescriptorList->pPrev = nullptr;
+	pFreeDescriptorList->iSize = 0;
+	size_t currentBlockDescriptor = 1;
+	while (true)
+	{
+		if (currentBlockDescriptor == numberOfDescriptors) {
+			break;
+		}
+		pFreeDescriptorList = pFreeDescriptorList->pNext;
+		if (currentBlockDescriptor == numberOfDescriptors - 1) {
+			pFreeDescriptorList->pNext = nullptr;
+		}
+		else {
+			pFreeDescriptorList->pNext = pFreeDescriptorList + sizeof(BlockDescriptor);
+		}
+		
+		pFreeDescriptorList->pPrev = pFreeDescriptorList - sizeof(BlockDescriptor);
+		pFreeDescriptorList->iSize = 0;
+		currentBlockDescriptor++;
+	}
+
+	pFreeDescriptorList->pHeap = (BlockDescriptor *)pFreeMemoryList;
+
+	pFreeDescriptorList->iSize = sizeHeap - (noOfDescriptors * sizeof(BlockDescriptor));
+
+
+	pOutstandingAllocatedList = nullptr;
+	return nullptr;
+}
+
+void * HeapAllocator::Allocate(size_t size) {
+
+	// Moving the free memory pointer after the requested size
+	size_t iRequestedBytes = size + sizeof(int);
+	size_t availableSize = GetAvailableSize();
+
+	// Safety check and garbage collection if required
+	if (size == 0) {
+		return NULL;
+	}
+
+	if (iRequestedBytes > availableSize) {
+		return NULL;
+	} 
+
+	/*Current Allocation Block*/
+	// Steps for new allocation
+	// 1) Update allocation for the first entry
+	// 2) Update allocation for the following entry
+	
+	if (pOutstandingAllocatedList == nullptr) {
+		pOutstandingAllocatedList = pFreeDescriptorList;
+
+		pOutstandingAllocatedList->pHeap = pFreeDescriptorList->pHeap;
+		// Move the free block descriptor for the next allocation
+		pFreeDescriptorList = pFreeDescriptorList->pPrev;
+
+		pOutstandingAllocatedList->pNext = nullptr;
+		pOutstandingAllocatedList->pPrev = nullptr;
+	}
+	else {
+		BlockDescriptor *prevAllocatedList = pOutstandingAllocatedList;
+		pOutstandingAllocatedList = pFreeDescriptorList;
+
+		// Check if pheap reached last, then do garbage collect
+
+
+		pOutstandingAllocatedList->pHeap = pFreeDescriptorList->pHeap;
+		// Move the free block descriptor for the next allocation
+		pFreeDescriptorList = pFreeDescriptorList->pPrev;
+
+		pOutstandingAllocatedList->pNext = prevAllocatedList;
+		pOutstandingAllocatedList->pPrev = nullptr;
+
+		pOutstandingAllocatedList->pNext->pPrev = pOutstandingAllocatedList;
+	}
+
+	pOutstandingAllocatedList->iSize = iRequestedBytes;
+
+	if (pFreeDescriptorList->pPrev == nullptr) {
+		// Do Garbage collect
+
+	}
+	else {
+		/*Next allocation Block*/
+		// Fetching previous block to update the next heap pointer
+		pFreeDescriptorList->pHeap = pOutstandingAllocatedList->pHeap + pOutstandingAllocatedList->iSize;
+		// Subtracting available memory with used Memory
+		pFreeDescriptorList->iSize = memSystemSize - (numberOfDescriptors * sizeof(BlockDescriptor)) - ((char *)pFreeMemoryList - (char*)pFreeDescriptorList->pHeap);
+		//pFreeDescriptorList->pPrev = pFreeDescriptorList + sizeof(BlockDescriptor);
+	}
+
+	//	availableMemorySize -= iRequestedBytes + iRequestedBytes;
+	return pOutstandingAllocatedList->pHeap;
+}
+
+void * HeapAllocator::Deallocate(void * deallocatePointer)
+{
+	BlockDescriptor *tempOutstandingAllocatedList = pOutstandingAllocatedList;
+	while (true)
+	{
+		if (deallocatePointer == tempOutstandingAllocatedList->pHeap) {
+			BlockDescriptor *swapPreviousFreeList = pFreeDescriptorList->pPrev;
+			pFreeDescriptorList->pPrev = tempOutstandingAllocatedList;
+
+
+			/*Cases to connect Allocated list*/
+			// Case 1) When previous and next are null. Single block entry.
+			if (tempOutstandingAllocatedList->pPrev == nullptr && tempOutstandingAllocatedList->pNext == nullptr) {
+				pOutstandingAllocatedList = nullptr;
+			}
+
+			// Case 2) When previous alone is nullptr. Multiple block entry. head at first position 
+			if (tempOutstandingAllocatedList->pPrev == nullptr && tempOutstandingAllocatedList->pNext != nullptr) {
+				tempOutstandingAllocatedList->pNext->pPrev = nullptr;
+			}
+
+			// Case 3) When next alone is nullptr. Multiple block entry. removal at last position
+			if (tempOutstandingAllocatedList->pPrev != nullptr && tempOutstandingAllocatedList->pNext == nullptr) {
+				tempOutstandingAllocatedList->pPrev->pNext = nullptr;
+			}
+
+			// Case 4) When previous and next are not null. Multiple block entry. Removal from centre of a contigous block.
+			if (tempOutstandingAllocatedList->pPrev != nullptr && tempOutstandingAllocatedList->pNext != nullptr) {
+				tempOutstandingAllocatedList->pPrev->pNext = tempOutstandingAllocatedList->pNext;
+				tempOutstandingAllocatedList->pNext->pPrev = tempOutstandingAllocatedList->pPrev;
+			}
+
+			// Add the removed allocated element to the free list
+			/*tempOutstandingAllocatedList->pNext = pFreeDescriptorList;
+			tempOutstandingAllocatedList->pPrev = pFreeDescriptorList->pPrev;
+			pFreeDescriptorList->pPrev->pNext = tempOutstandingAllocatedList;
+			pFreeDescriptorList->pPrev = tempOutstandingAllocatedList;*/
+			AddToFreeBlocks(tempOutstandingAllocatedList);
+
+			deallocatePointer = nullptr;
+			break;
+		}
+		tempOutstandingAllocatedList = tempOutstandingAllocatedList->pNext;
+		if(tempOutstandingAllocatedList == nullptr) {
+			break;
+		}
+	}
+
+	return nullptr;
+}
+
+void HeapAllocator::AddToFreeBlocks(BlockDescriptor *freedBlock) {
+	// Start from head of free list
+
+		
+
+		
+			// add the block to head
+		// if address is not greater than any element
+			// add the block to the end of the heap
+	BlockDescriptor * pfreeDescriptorCurrentRef = pFreeDescriptorList;
+	while (true)
+	{
+		// if address is great than the current element and less than the next element
+		if (freedBlock > pfreeDescriptorCurrentRef && freedBlock < pfreeDescriptorCurrentRef->pNext) {
+			// add the block in between
+
+		}
+		// if address is less than any element and previous element is null
+		else if (freedBlock->pHeap < pfreeDescriptorCurrentRef && pfreeDescriptorCurrentRef->pPrev == nullptr) {
+			// add the block before the head
+		}
+		else  if (freedBlock->pHeap > pfreeDescriptorCurrentRef && pfreeDescriptorCurrentRef->pNext == nullptr) {
+		
+		}
+
+
+
+
+		pfreeDescriptorCurrentRef = pfreeDescriptorCurrentRef->pNext;
+	}
+
+	// terminate at /0
+}
+
+size_t HeapAllocator::ShowFreeBlocks()
+{
+	size_t freeDescriptors = numberOfDescriptors - ShowAllocatedBlocks();
+	return freeDescriptors;
+}
+
+size_t HeapAllocator::ShowAllocatedBlocks() {
+	BlockDescriptor *tempOutstandingAllocatedList = pOutstandingAllocatedList;
+	size_t allocatedListCount = 0;
+	do
+	{
+		// For checking the first entry
+		if (tempOutstandingAllocatedList == nullptr) {
+			break;
+		}
+		allocatedListCount++;
+		tempOutstandingAllocatedList = tempOutstandingAllocatedList->pNext;
+	} while (tempOutstandingAllocatedList != nullptr);
+	return allocatedListCount;
+}
+
+size_t HeapAllocator::GetAvailableSize() {
+	BlockDescriptor *tempFreeDescriptorList = pFreeDescriptorList;
+	size_t availableSize = 0;
+	do {
+		availableSize += tempFreeDescriptorList->iSize;
+		tempFreeDescriptorList = tempFreeDescriptorList->pPrev;
+	} while (tempFreeDescriptorList->pPrev != nullptr);
+	return availableSize;
+}
+
+
+void GarbageCollect(GarbageCollectionType garbageCollectionType) {
+	switch (garbageCollectionType)
+	{
+	case DescriptorFix:
+
+		break;
+	case StorageFix:
+
+
+		break;
+	default:
+		break;
+	}
+}
